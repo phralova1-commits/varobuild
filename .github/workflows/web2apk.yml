@@ -1,0 +1,176 @@
+name: Web2APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        required: true
+      app_name:
+        required: true
+      icon_url:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.38.0"
+          channel: stable
+          cache: true
+
+      - name: Create Project
+        run: flutter create --org com.webapk --platforms=android myapp
+
+      - name: Add Dependencies
+        working-directory: myapp
+        run: |
+          flutter pub add webview_flutter || flutter pub add webview_flutter || exit 1
+
+      - name: Generate main.dart
+        run: |
+          cat > myapp/lib/main.dart << 'DART'
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const String kUrl = String.fromEnvironment('WEB_URL', defaultValue: 'https://example.com');
+          const String kName = String.fromEnvironment('APP_NAME', defaultValue: 'Web App');
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const MyApp());
+          }
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kName,
+                debugShowCheckedModeBanner: false,
+                home: const WebViewPage(),
+              );
+            }
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController _controller;
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse(kUrl));
+            }
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvokedWithResult: (didPop, result) async {
+                  if (didPop) return;
+                  if (await _controller.canGoBack()) {
+                    await _controller.goBack();
+                  } else {
+                    SystemNavigator.pop();
+                  }
+                },
+                child: Scaffold(body: SafeArea(child: WebViewWidget(controller: _controller))),
+              );
+            }
+          }
+          DART
+
+      - name: Apply name, permission and icon
+        working-directory: myapp
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          ICON_URL: ${{ github.event.inputs.icon_url }}
+        run: |
+          set +e
+          MF=android/app/src/main/AndroidManifest.xml
+
+          LABEL=$(printf '%s' "$APP_NAME" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")
+          ESC=$(printf '%s' "$LABEL" | sed -e 's/[\/&|]/\\&/g')
+          sed -i "s|android:label=\"[^\"]*\"|android:label=\"$ESC\"|" "$MF"
+
+          grep -q "android.permission.INTERNET" "$MF" || \
+            sed -i '0,/<manifest[^>]*>/s//&\n    <uses-permission android:name="android.permission.INTERNET"\/>/' "$MF"
+          grep -q "usesCleartextTraffic" "$MF" || \
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MF"
+
+          mkdir -p assets
+          curl -sL -o /tmp/icon_raw "$ICON_URL"
+          if command -v convert >/dev/null 2>&1; then
+            convert /tmp/icon_raw -resize 512x512^ -gravity center -extent 512x512 PNG32:assets/icon.png
+          else
+            cp /tmp/icon_raw assets/icon.png
+          fi
+
+          if [ -s assets/icon.png ]; then
+            flutter pub add --dev flutter_launcher_icons
+            cat >> pubspec.yaml << 'EOF'
+
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon.png"
+          EOF
+            dart run flutter_launcher_icons || echo "icon gagal dipasang, lanjut tanpa icon"
+          else
+            echo "icon tidak terunduh, pakai icon default"
+          fi
+          exit 0
+
+      - name: Build APK
+        working-directory: myapp
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          WEB_URL: ${{ github.event.inputs.web_url }}
+        run: |
+          set +e
+          build() {
+            flutter build apk --release --target-platform android-arm64 --no-tree-shake-icons \
+              --dart-define=WEB_URL="$WEB_URL" --dart-define=APP_NAME="$APP_NAME" 2>&1 | tee "$1"
+          }
+          found() { find build -name '*.apk' 2>/dev/null | head -n 1; }
+
+          build /tmp/w1.log
+          [ -n "$(found)" ] && exit 0
+
+          echo "=== RETRY: clean ==="
+          flutter clean
+          flutter pub get
+          build /tmp/w2.log
+          [ -n "$(found)" ] && exit 0
+
+          echo "[RESULT_DART_ERROR]"
+          echo "BUILD GAGAL"
+          grep -hE "Error:|What went wrong|Execution failed|[a-zA-Z0-9_/.-]+\.(dart|gradle|kt|java|xml):[0-9]+" /tmp/w2.log | awk '!s[$0]++' | head -n 30
+          echo "════════ BARIS TERAKHIR ════════"
+          tail -n 40 /tmp/w2.log
+          echo "[END_RESULT_DART_ERROR]"
+          exit 1
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-release
+          path: myapp/build/app/outputs/flutter-apk/*.apk
+          retention-days: 1
+          if-no-files-found: error
