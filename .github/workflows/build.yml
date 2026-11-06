@@ -1,0 +1,670 @@
+name: Flutter to apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+      build_type:
+        description: 'release / debug'
+        required: false
+        default: 'release'
+
+concurrency:
+  group: build-${{ github.event.inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.parallel=true
+        -Dorg.gradle.caching=true
+        -Dorg.gradle.configureondemand=true
+        -Dorg.gradle.workers.max=4
+        -Dorg.gradle.jvmargs=-Xmx3g
+
+    steps:
+      - name: Parse payload
+        run: |
+          set -euo pipefail
+          echo '${{ github.event.inputs.payload }}' > payload.json
+          cat payload.json
+          ZIP_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::Tidak ada zipAssetUrl / url di payload"
+            exit 1
+          fi
+          echo "ZIP_URL=$ZIP_URL" >> "$GITHUB_ENV"
+
+      - name: Download & extract ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf project_raw project.zip
+          mkdir -p project_raw
+
+          if [[ "$ZIP_URL" == *"api.github.com"* ]]; then
+            curl -fL --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip "$ZIP_URL"
+          else
+            curl -fL --retry 3 --retry-delay 5 -o project.zip "$ZIP_URL"
+          fi
+
+          ls -lh project.zip
+          unzip -q project.zip -d project_raw
+
+          echo "=== Struktur root project_raw ==="
+          find project_raw -maxdepth 3 -type d | head -50
+          echo ""
+          echo "=== File kunci ==="
+          find project_raw -maxdepth 6 -type f \
+            \( -name "gradlew" -o -name "pubspec.yaml" \
+               -o -name "settings.gradle" -o -name "settings.gradle.kts" \
+               -o -name "build.gradle" -o -name "build.gradle.kts" \) \
+            -not -path "*/build/*" | head -30
+
+      - name: Detect project type
+        id: detect
+        run: |
+          set -euo pipefail
+          PUBSPEC=$(find project_raw -type f -name pubspec.yaml \
+                    -not -path "*/build/*" -not -path "*/.dart_tool/*" | head -n 1)
+          GRADLEW=$(find project_raw -type f -name gradlew \
+                    -not -path "*/build/*" | head -n 1)
+          SETTINGS=$(find project_raw -type f \
+                    \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+                    -not -path "*/build/*" | head -n 1)
+
+          echo "pubspec : ${PUBSPEC:-<none>}"
+          echo "gradlew : ${GRADLEW:-<none>}"
+          echo "settings: ${SETTINGS:-<none>}"
+
+          if [ -n "$PUBSPEC" ]; then
+            DIR=$(dirname "$PUBSPEC")
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Flutter project → $DIR"
+          elif [ -n "$GRADLEW" ]; then
+            DIR=$(dirname "$GRADLEW")
+            echo "type=gradle"  >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Native Gradle project → $DIR"
+          elif [ -n "$SETTINGS" ]; then
+            DIR=$(dirname "$SETTINGS")
+            echo "type=gradle"  >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Gradle project (no wrapper) → $DIR"
+          else
+            echo "::error::Project tidak dikenali (bukan Flutter / bukan Gradle)."
+            find project_raw -maxdepth 3
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.0'
+          channel: stable
+          cache: true
+
+      - name: Cache pub packages
+        if: steps.detect.outputs.type == 'flutter'
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('project_raw/**/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Ensure yq
+        run: |
+          command -v yq >/dev/null 2>&1 || {
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          }
+          yq --version
+
+      - name: Tune gradle.properties
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.type }}" = "flutter" ]; then
+            GP="${{ steps.detect.outputs.dir }}/android/gradle.properties"
+          else
+            GP="${{ steps.detect.outputs.dir }}/gradle.properties"
+          fi
+          mkdir -p "$(dirname "$GP")"
+          touch "$GP"
+          sed -i '/org.gradle.jvmargs/d;/org.gradle.parallel/d;/org.gradle.caching/d;/org.gradle.daemon/d;/org.gradle.configureondemand/d;/org.gradle.workers.max/d' "$GP" || true
+          {
+            echo ""
+            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g"
+            echo "org.gradle.parallel=true"
+            echo "org.gradle.caching=true"
+            echo "org.gradle.daemon=false"
+            echo "org.gradle.configureondemand=true"
+            echo "org.gradle.workers.max=4"
+          } >> "$GP"
+
+      - name: Helper scripts
+        run: |
+          cat > /tmp/fixplugins.sh << 'HELPER_FIX'
+          set +e
+          PC="${PUB_CACHE:-$HOME/.pub-cache}"
+          find "$PC/hosted" "$PC/git" -path "*/android/build.gradle" -not -path "*/example/*" 2>/dev/null | while read -r g; do
+            grep -q "namespace" "$g" && continue
+            M="$(dirname "$g")/src/main/AndroidManifest.xml"
+            [ -f "$M" ] || continue
+            PKG=$(grep -oE 'package="[^"]+"' "$M" | head -n 1 | cut -d'"' -f2)
+            [ -z "$PKG" ] && continue
+            sed -i "0,/android[[:space:]]*{/s//android {\n    namespace \"$PKG\"/" "$g"
+            echo "namespace $PKG -> $g"
+          done
+
+          cat > /tmp/stub.tpl << 'EOF'
+          package io.flutter.plugin.common;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.view.View;
+          import io.flutter.plugin.platform.PlatformViewRegistry;
+          import io.flutter.view.TextureRegistry;
+
+          public class __NAME__ {
+            public Activity activity() { return null; }
+            public Context context() { return null; }
+            public Context activeContext() { return null; }
+            public BinaryMessenger messenger() { return null; }
+            public View view() { return null; }
+            public TextureRegistry textures() { return null; }
+            public PlatformViewRegistry platformViewRegistry() { return null; }
+            public String lookupKeyForAsset(String asset) { return asset; }
+            public String lookupKeyForAsset(String asset, String pkg) { return asset; }
+            public __NAME__ publish(Object value) { return this; }
+            public __NAME__ addActivityResultListener(PluginRegistry.ActivityResultListener l) { return this; }
+            public __NAME__ addRequestPermissionsResultListener(PluginRegistry.RequestPermissionsResultListener l) { return this; }
+            public __NAME__ addNewIntentListener(PluginRegistry.NewIntentListener l) { return this; }
+            public __NAME__ addUserLeaveHintListener(PluginRegistry.UserLeaveHintListener l) { return this; }
+          }
+          EOF
+
+          find "$PC/hosted" "$PC/git" -name "*.java" 2>/dev/null \
+            | xargs -r grep -lE "PluginRegistry\.Registrar|io\.flutter\.view\.FlutterView" 2>/dev/null \
+            | while read -r jf; do
+                PLUG=$(echo "$jf" | sed -E 's#.*/(hosted/[^/]+|git)/([^/]+)/.*#\2#' | sed 's/[^A-Za-z0-9_]/_/g')
+                STUB="LegacyRegistrar_$PLUG"
+                JROOT="${jf%%/java/*}/java"
+                mkdir -p "$JROOT/io/flutter/plugin/common"
+                sed "s/__NAME__/$STUB/g" /tmp/stub.tpl > "$JROOT/io/flutter/plugin/common/$STUB.java"
+                STUB="$STUB" perl -0pi -e 's/[ \t]*public\s+static\s+void\s+registerWith\s*\(\s*(?:io\.flutter\.plugin\.common\.)?PluginRegistry\.Registrar\s+\w+\s*\)\s*\{.*?\n[ \t]*\}[ \t]*\n//s; s/import\s+io\.flutter\.view\.FlutterView;\n//g; s/\bFlutterView\b/android.view.View/g; s/(?:io\.flutter\.plugin\.common\.)?PluginRegistry\.Registrar/io.flutter.plugin.common.$ENV{STUB}/g' "$jf"
+                echo "patch v1 embedding -> $jf (stub $STUB)"
+              done
+          exit 0
+          HELPER_FIX
+
+          cat > /tmp/tune_android.sh << 'HELPER_TUNE'
+          set +e
+          cd "$1" || exit 0
+          mkdir -p android
+          GP=android/gradle.properties
+          touch "$GP"
+          grep -q "org.gradle.jvmargs" "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> "$GP"
+          grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+
+          MF=android/app/src/main/AndroidManifest.xml
+          if [ -f "$MF" ] && ! grep -q "android.permission.INTERNET" "$MF"; then
+            sed -i '0,/<manifest[^>]*>/s//&\n    <uses-permission android:name="android.permission.INTERNET"\/>/' "$MF"
+          fi
+
+          for F in android/app/build.gradle.kts android/app/build.gradle; do
+            [ -f "$F" ] || continue
+            grep -q "checkReleaseBuilds" "$F" && continue
+            case "$F" in
+              *.kts) L='    lint { checkReleaseBuilds = false; abortOnError = false }' ;;
+              *)     L='    lint { checkReleaseBuilds false; abortOnError false }' ;;
+            esac
+            sed -i "0,/^android[[:space:]]*{/s//android {\n$L/" "$F"
+          done
+          exit 0
+          HELPER_TUNE
+
+          cat > /tmp/regen_android.sh << 'HELPER_REGEN'
+          set +e
+          cd "$1" || exit 1
+          O=/tmp/android_orig
+          NAME=$(yq '.name' pubspec.yaml)
+
+          rm -rf /tmp/lib_bak && cp -r lib /tmp/lib_bak
+          rm -rf android .dart_tool
+          flutter create --platforms=android --project-name "$NAME" . > /dev/null 2>&1
+          rm -rf lib && cp -r /tmp/lib_bak lib && rm -rf test
+
+          NM=android/app/src/main/AndroidManifest.xml
+          OM="$O/app/src/main/AndroidManifest.xml"
+          RES=android/app/src/main/res
+          ORES="$O/app/src/main/res"
+
+          if [ -d "$ORES" ]; then
+            mkdir -p "$RES"
+            for d in "$ORES"/mipmap-* "$ORES"/drawable*; do
+              [ -d "$d" ] || continue
+              rm -rf "$RES/$(basename "$d")"
+              cp -r "$d" "$RES/"
+            done
+            for d in "$ORES"/values*; do
+              [ -d "$d" ] || continue
+              mkdir -p "$RES/$(basename "$d")"
+              for f in strings.xml colors.xml; do
+                [ -f "$d/$f" ] && cp "$d/$f" "$RES/$(basename "$d")/$f"
+              done
+            done
+          fi
+
+          if [ -f "$OM" ] && [ -f "$NM" ]; then
+            APPTAG=$(tr '\n' ' ' < "$OM" | grep -oE '<application[^>]*>' | head -n 1)
+            for A in label icon roundIcon; do
+              V=$(echo "$APPTAG" | grep -oE "android:$A=\"[^\"]*\"" | head -n 1 | cut -d'"' -f2)
+              [ -z "$V" ] && continue
+              VE=$(printf '%s' "$V" | sed -e 's/[\/&|]/\\&/g')
+              if grep -q "android:$A=" "$NM"; then
+                sed -i -E "s|android:$A=\"[^\"]*\"|android:$A=\"$VE\"|" "$NM"
+              else
+                sed -i "0,/<application/s||<application android:$A=\"$VE\"|" "$NM"
+              fi
+              echo "dipulihkan: android:$A=$V"
+            done
+          fi
+
+          OG=$(ls "$O"/app/build.gradle.kts "$O"/app/build.gradle 2>/dev/null | head -n 1)
+          AID=""
+          [ -n "$OG" ] && AID=$(grep -hoE 'applicationId[[:space:]]*=?[[:space:]]*"[^"]+"' "$OG" | head -n 1 | cut -d'"' -f2)
+          [ -z "$AID" ] && [ -f "$OM" ] && AID=$(grep -oE 'package="[^"]+"' "$OM" | head -n 1 | cut -d'"' -f2)
+          if [ -n "$AID" ]; then
+            for F in android/app/build.gradle.kts android/app/build.gradle; do
+              [ -f "$F" ] && sed -i -E "s|(applicationId[[:space:]]*=?[[:space:]]*)\"[^\"]*\"|\1\"$AID\"|" "$F"
+            done
+            echo "dipulihkan: applicationId=$AID"
+          fi
+
+          bash /tmp/tune_android.sh "$PWD"
+          exit 0
+          HELPER_REGEN
+
+          cat > /tmp/adaptive_build.sh << 'HELPER_BUILD'
+          set +e
+          MODE="${1:-release}"
+          LOG=/tmp/b.log
+          found() { find build -name '*.apk' 2>/dev/null | head -n 1; }
+
+          fatal_dart() {
+            grep -qE "(^|[[:space:]])lib/[A-Za-z0-9_/.-]+\.dart:[0-9]+:[0-9]+: Error" "$LOG"
+          }
+
+          failing_plugin() {
+            P=$(grep -oE "task ':[A-Za-z0-9_.-]+:" "$LOG" | head -n 1 | sed -E "s/task ':([^:]+):/\1/")
+            if [ -z "$P" ]; then
+              P=$(grep -oE "pub\.dev/[a-z0-9_]+-[0-9][^/]*/" "$LOG" | head -n 1 | sed -E 's#pub\.dev/([a-z0-9_]+)-.*#\1#')
+            fi
+            case "$P" in app|gradle|"") P="" ;; esac
+            echo "$P"
+          }
+
+          set_minsdk() {
+            for F in android/app/build.gradle.kts android/app/build.gradle; do
+              [ -f "$F" ] || continue
+              sed -i -E "/^[[:space:]]*minSdk/s/(minSdk(Version)?)[[:space:]]*=?[[:space:]]*[A-Za-z0-9_.]+/\1 = $1/" "$F"
+            done
+          }
+
+          regen_android() {
+            bash /tmp/regen_android.sh "$PWD"
+          }
+
+          if [ "$MODE" = "debug" ]; then
+            FLAGS="--debug --target-platform android-arm64"
+          else
+            FLAGS="--release --target-platform android-arm64 --no-tree-shake-icons"
+          fi
+
+          REMOVED=""
+          REGEN=0
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            echo "=== ROUND $round: flutter build apk $FLAGS ==="
+            flutter build apk $FLAGS 2>&1 | tee "$LOG"
+
+            if [ -n "$(found)" ]; then
+              echo "✅ APK jadi (round $round)"
+              [ -n "$REMOVED" ] && echo "⚠️ Plugin dihapus otomatis (tidak dipakai di lib/):$REMOVED"
+              exit 0
+            fi
+
+            if fatal_dart; then
+              echo "🛑 Error di kode Dart (lib/): tidak bisa diperbaiki otomatis"
+              break
+            fi
+
+            MS=$(grep -oE "minSdkVersion [0-9]+ cannot be smaller than version [0-9]+" "$LOG" | grep -oE "[0-9]+$" | sort -n | tail -n 1)
+            if [ -n "$MS" ]; then
+              echo "🔧 minSdk dinaikkan ke $MS"
+              set_minsdk "$MS"
+              continue
+            fi
+
+            P=$(failing_plugin)
+            if [ -n "$P" ] && [ "$(yq ".dependencies | has(\"$P\")" pubspec.yaml)" = "true" ]; then
+              if [ ! -f "/tmp/tried_up_$P" ]; then
+                touch "/tmp/tried_up_$P"
+                echo "🔧 plugin $P gagal: coba upgrade versi"
+                yq -i ".dependencies.\"$P\" = \"any\"" pubspec.yaml
+                flutter pub upgrade "$P"
+                bash /tmp/fixplugins.sh
+                continue
+              fi
+              if [ ! -f "/tmp/tried_rm_$P" ]; then
+                touch "/tmp/tried_rm_$P"
+                echo "🔧 plugin $P tetap gagal: dihapus dari pubspec"
+                yq -i "del(.dependencies.\"$P\")" pubspec.yaml
+                REMOVED="$REMOVED $P"
+                flutter pub get
+                bash /tmp/fixplugins.sh
+                continue
+              fi
+            fi
+
+            if [ "$REGEN" -eq 0 ]; then
+              REGEN=1
+              echo "🔧 android/ dibuat ulang"
+              regen_android
+              flutter pub get
+              continue
+            fi
+            if [ "$REGEN" -eq 1 ] && [ "$MODE" != "debug" ]; then
+              REGEN=2
+              echo "🔧 coba tanpa shrink, semua ABI"
+              FLAGS="--release --no-tree-shake-icons --no-shrink"
+              continue
+            fi
+            break
+          done
+
+          echo "[RESULT_DART_ERROR]"
+          echo "BUILD GAGAL"
+          [ -n "$REMOVED" ] && echo "Plugin dihapus otomatis karena tidak kompatibel:$REMOVED"
+          grep -hE "lib/.*(Error|error)|Error:|Error \(|Undefined|isn't defined|Expected|What went wrong|Execution failed|[a-zA-Z0-9_/.-]+\.(dart|gradle|kt|java|xml):[0-9]+" "$LOG" 2>/dev/null | awk '!s[$0]++' | head -n 30
+          echo "════════ BARIS TERAKHIR ════════"
+          tail -n 40 "$LOG"
+          echo "[END_RESULT_DART_ERROR]"
+          exit 1
+          HELPER_BUILD
+
+      - name: Repair project (force)
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set +e
+
+          [ -d android ] && [ ! -d /tmp/android_orig ] && cp -r android /tmp/android_orig
+
+          if [ -f pubspec.yaml ]; then
+            sed -i '1s/^\xEF\xBB\xBF//; s/\r$//; s/\t/  /g' pubspec.yaml
+          fi
+
+          NAME=$(grep -m1 -E '^name:' pubspec.yaml 2>/dev/null | sed -E 's/^name:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]+$//')
+          echo "$NAME" | grep -qE '^[a-z_][a-z0-9_]*$' || NAME="app_$(date +%s)"
+
+          if [ ! -f pubspec.yaml ] || ! yq '.' pubspec.yaml > /dev/null 2>&1; then
+            echo "⚠️ pubspec rusak/tidak ada, dibangun ulang dari import kode Dart"
+            [ -f pubspec.yaml ] && cp pubspec.yaml /tmp/pubspec.broken && cat -n /tmp/pubspec.broken | head -60
+
+            {
+              echo "name: $NAME"
+              echo "description: \"Flutter app\""
+              echo "version: 1.0.0+1"
+              echo "publish_to: none"
+              echo "environment:"
+              echo "  sdk: \">=3.0.0 <4.0.0\""
+              echo "dependencies:"
+              echo "  flutter:"
+              echo "    sdk: flutter"
+              grep -rhoE "package:[a-z0-9_]+" lib 2>/dev/null | cut -d: -f2 | sort -u \
+                | grep -vxE "flutter|$NAME|flutter_test" | while read -r p; do echo "  $p: any"; done
+              echo "flutter:"
+              echo "  uses-material-design: true"
+              if [ -d assets ]; then echo "  assets:"; echo "    - assets/"; fi
+            } > pubspec.yaml
+          fi
+
+          yq -i ".name = \"$NAME\"" pubspec.yaml
+          yq -i '.dependencies.flutter.sdk = "flutter"' pubspec.yaml
+          yq -i 'del(.dev_dependencies)' pubspec.yaml
+
+          SDK=$(yq '.environment.sdk // ""' pubspec.yaml)
+          echo "$SDK" | grep -qE '^(\^|>=)3' || yq -i '.environment.sdk = ">=3.0.0 <4.0.0"' pubspec.yaml
+
+          yq '(.flutter.assets // [])[] | select(tag == "!!str")' pubspec.yaml 2>/dev/null | while read -r a; do
+            [ -z "$a" ] && continue
+            [ -e "$a" ] && continue
+            case "$a" in
+              */) mkdir -p "$a" ;;
+              *)  mkdir -p "$(dirname "$a")" && touch "$a" ;;
+            esac
+          done
+          yq '(.flutter.fonts // [])[] | (.fonts // [])[] | .asset' pubspec.yaml 2>/dev/null | while read -r f; do
+            { [ -z "$f" ] || [ "$f" = "null" ] || [ -e "$f" ]; } && continue
+            mkdir -p "$(dirname "$f")" && touch "$f"
+          done
+
+          if [ "$(yq '.dependencies | has("better_player")' pubspec.yaml)" = "true" ]; then
+            yq -i '.dependency_overrides.path_provider //= "2.1.4"' pubspec.yaml
+          fi
+
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            echo "⚠️ android/ tidak lengkap, dibuat ulang (label, ikon, applicationId asli dipulihkan)"
+            bash /tmp/regen_android.sh "$PWD"
+          fi
+
+          MF=android/app/src/main/AndroidManifest.xml
+          if [ -f "$MF" ] && ! grep -q "android.permission.INTERNET" "$MF"; then
+            sed -i '0,/<manifest[^>]*>/s//&\n    <uses-permission android:name="android.permission.INTERNET"\/>/' "$MF"
+          fi
+
+          mkdir -p android
+          GP=android/gradle.properties
+          touch "$GP"
+          grep -q "org.gradle.jvmargs" "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> "$GP"
+          grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+
+          bash /tmp/tune_android.sh "$PWD"
+
+          echo "=== pubspec akhir ==="
+          cat pubspec.yaml
+          exit 0
+
+      - name: Pub Get (force)
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          rm -f pubspec.lock
+
+          echo "=== 1. pub get ==="
+          flutter pub get && exit 0
+
+          echo "=== 2. pub upgrade ==="
+          flutter pub upgrade && exit 0
+
+          echo "=== 3. pub upgrade --major-versions ==="
+          flutter pub upgrade --major-versions && exit 0
+
+          echo "=== 4. semua versi jadi any ==="
+          yq -i '(.dependencies[] | select(tag == "!!str")) = "any"' pubspec.yaml
+          yq -i 'del(.dependency_overrides)' pubspec.yaml
+          flutter pub get && exit 0
+
+          echo "=== 5. hapus dependency yang gagal satu per satu ==="
+          for i in 1 2 3 4 5 6 7 8; do
+            OUT=$(flutter pub get 2>&1)
+            if [ $? -eq 0 ]; then exit 0; fi
+            BAD=$(echo "$OUT" | grep -oE "(depends on|Because) [a-z0-9_]+" | awk '{print $NF}' \
+                  | grep -vxE "flutter|$(yq '.name' pubspec.yaml)" | head -n 1)
+            [ -z "$BAD" ] && break
+            echo "hapus: $BAD"
+            yq -i "del(.dependencies.\"$BAD\")" pubspec.yaml
+          done
+
+          echo "Pub get gagal total, lanjut build"
+          echo "$OUT" | tail -n 30
+          exit 0
+
+      - name: Fix plugin lama
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: bash /tmp/fixplugins.sh
+
+      - name: Build Flutter APK (adaptive)
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: bash /tmp/adaptive_build.sh "${{ github.event.inputs.build_type }}"
+
+      - name: Build Native APK
+        if: steps.detect.outputs.type == 'gradle'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set -euo pipefail
+          BT="${{ github.event.inputs.build_type }}"
+          [ -z "$BT" ] && BT=release
+          if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
+
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            CMD="./gradlew"
+            echo "✅ Pakai gradle wrapper"
+          else
+            echo "⚠️ gradlew tidak ada, generate wrapper dulu"
+            gradle wrapper --gradle-version 8.7 || true
+            if [ -f gradlew ]; then
+              chmod +x gradlew
+              CMD="./gradlew"
+            else
+              CMD="gradle"
+            fi
+          fi
+
+          echo "Running: $CMD $TASK"
+          $CMD "$TASK" \
+            --parallel --build-cache \
+            -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log || {
+              echo "::error::Build gagal. Cek log di atas."
+              tail -100 build.log
+              exit 1
+            }
+
+      - name: Debug - scan all APK
+        if: failure()
+        run: |
+          echo "=== SEMUA APK di project_raw ==="
+          find project_raw -type f -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "TIDAK ADA APK"
+          echo ""
+          echo "=== Tree project_raw/*/build/outputs ==="
+          find project_raw -type d -name "outputs" -exec find {} -maxdepth 3 -type d \; 2>/dev/null || true
+
+      - name: Locate APK
+        id: locate
+        run: |
+          set -euo pipefail
+          APK=""
+
+          echo "↩️ Strategy 1 (exclude intermediates/tmp/kotlin/.gradle)"
+          APK=$(find project_raw -type f -name "*.apk" \
+                -not -path "*/intermediates/*" \
+                -not -path "*/tmp/*" \
+                -not -path "*/kotlin/*" \
+                -not -path "*/.gradle/*" \
+                2>/dev/null | head -n 1 || true)
+
+          if [ -z "$APK" ]; then
+            echo "↩️ Strategy 2 (include intermediates)"
+            APK=$(find project_raw -type f -name "*.apk" \
+                  -not -path "*/.gradle/*" \
+                  2>/dev/null | head -n 1 || true)
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "↩️ Strategy 3 (flutter-build path)"
+            APK=$(find project_raw -type f -name "*.apk" \
+                  -path "*/flutter-build/*" \
+                  2>/dev/null | head -n 1 || true)
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah semua strategy."
+            echo "=== Isi build.log ==="
+            tail -100 "${{ steps.detect.outputs.dir }}/build.log" 2>/dev/null || echo "(build.log tidak ada)"
+            echo ""
+            echo "=== Semua file .apk (full scan) ==="
+            find / -type f -name "*.apk" 2>/dev/null | grep -v "/proc/" | head -20 || true
+            exit 1
+          fi
+
+          APK_DIR=$(dirname "$APK")
+          APK_SIZE=$(stat -c%s "$APK" 2>/dev/null || echo "0")
+          echo "✅ APK ditemukan: $APK"
+          echo "📁 Folder: $APK_DIR"
+          echo "📦 Size: $APK_SIZE bytes"
+
+          if [ "$APK_SIZE" -lt 1000 ]; then
+            echo "::error::APK terlalu kecil ($APK_SIZE bytes), kemungkinan corrupt."
+            exit 1
+          fi
+
+          echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.event.inputs.jobId }}
+          path: |
+            ${{ steps.detect.outputs.dir }}/build.log
+            ${{ steps.detect.outputs.dir }}/android/build.log
+          if-no-files-found: ignore
+          retention-days: 1
